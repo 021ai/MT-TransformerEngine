@@ -55,6 +55,10 @@ extern PyTypeObject *MXFP8TensorPythonClass;
 extern PyTypeObject *MXFP8TensorBasePythonClass;
 extern PyTypeObject *MXFP8QuantizerClass;
 
+extern PyTypeObject *MTFP8TensorPythonClass;
+extern PyTypeObject *MTFP8TensorBasePythonClass;
+extern PyTypeObject *MTFP8QuantizerClass;
+
 void init_extension();
 
 void init_float8_extension();
@@ -90,9 +94,21 @@ inline bool IsFloatingPointType(at::ScalarType type) {
   return type == at::kFloat || type == at::kHalf || type == at::kBFloat16;
 }
 
+inline bool IsMTFP8Tensor(PyObject *obj) {
+  return Py_TYPE(obj) == MTFP8TensorPythonClass || Py_TYPE(obj) == MTFP8TensorBasePythonClass;
+}
+
+inline bool IsMTFP8QParams(PyObject *obj) { return Py_TYPE(obj) == MTFP8QuantizerClass; }
+
+TensorWrapper NVTETensorFromMTFP8Tensor(py::handle tensor, Quantizer *quantization_params);
+
+std::unique_ptr<Quantizer> CreateMTFP8Params(const py::handle params);
+
 constexpr std::array custom_types_converters = {
     std::make_tuple(IsFloat8Tensor, IsFloat8QParams, NVTETensorFromFloat8Tensor,
                     CreateQuantizer<Float8Quantizer>),
+    std::make_tuple(IsMTFP8Tensor, IsMTFP8QParams, NVTETensorFromMTFP8Tensor,
+                    CreateQuantizer<MTFP8Quantizer>),
     std::make_tuple(IsMXFP8Tensor, IsMXFP8QParams, NVTETensorFromMXFP8Tensor,
                     CreateQuantizer<MXFP8Quantizer>)};
 

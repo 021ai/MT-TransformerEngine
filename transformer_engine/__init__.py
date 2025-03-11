@@ -9,10 +9,8 @@
 from importlib import metadata
 import transformer_engine.common
 
-try:
-    from . import pytorch
-except (ImportError, StopIteration) as e:
-    pass
+from . import pytorch
+from . import musa
 
 try:
     from . import jax
