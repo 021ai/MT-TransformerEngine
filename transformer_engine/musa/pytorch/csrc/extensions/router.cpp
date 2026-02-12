@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "../extensions.h"
+#include <cstdlib>
 #include "common.h"
 
 namespace transformer_engine::pytorch {
@@ -36,6 +37,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
   int group_topk_value = group_topk.has_value() ? group_topk.value() : -1;
   int num_groups_value = num_groups.has_value() ? num_groups.value() : -1;
   float scaling_factor_value = scaling_factor.has_value() ? scaling_factor.value() : 1.0f;
+  bool use_double_buffer = false;
+  if (const char *double_buffer_env = std::getenv("TE_ROUTER_DOUBLE_BUFFER")) {
+    use_double_buffer = std::atoi(double_buffer_env) != 0;
+  }
 
   // Construct the output tensor
   at::Tensor probs =
@@ -58,8 +63,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
   nvte_fused_topk_with_score_function_forward(
       logits_cu.data(), num_tokens, num_experts, topk, use_pre_softmax, num_groups_value,
       group_topk_value, scaling_factor_value, score_function_map[score_function],
-      expert_bias_cu.data(), probs_cu.data(), routing_map_cu.data(), intermediate_output_cu.data(),
-      at::musa::getCurrentMUSAStream());
+      static_cast<int>(use_double_buffer), expert_bias_cu.data(), probs_cu.data(),
+      routing_map_cu.data(), intermediate_output_cu.data(), at::musa::getCurrentMUSAStream());
 
   return std::make_tuple(probs, routing_map, intermediate_output);
 }

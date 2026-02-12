@@ -24,6 +24,7 @@ extern "C" {
  *  \param[in]     group_topk      Grouped topk value.
  *  \param[in]     scaling_factor  Scaling factor.
  *  \param[in]     score_function  Score function, 0: sigmoid, 1: softmax.
+ *  \param[in]     use_double_buffer  Whether to enable shared-memory double buffering.
  *  \param[in]     expert_bias     Expert bias. (Only used at the sigmoid case)
  *  \param[out]    probs           Output tensor for probabilities.
  *  \param[out]    routing_map     Output tensor for routing map.
@@ -33,7 +34,7 @@ extern "C" {
 void nvte_fused_topk_with_score_function_forward(
     const NVTETensor logits, int num_tokens, int num_experts, int topk, int use_pre_softmax,
     int num_groups, int group_topk, float scaling_factor, int score_function,
-    const NVTETensor expert_bias, NVTETensor probs, NVTETensor routing_map,
+    int use_double_buffer, const NVTETensor expert_bias, NVTETensor probs, NVTETensor routing_map,
     NVTETensor intermediate_output, musaStream_t stream);
 
 /*! \brief Backward pass for fused topk + softmax/sigmoid.

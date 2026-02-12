@@ -34,12 +34,10 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
   int lane_id = threadIdx.x % kThreadsPerWarp;
   extern __shared__ float shmem_scores_for_aux_loss[];
   DataType *logits_buf = reinterpret_cast<DataType *>(shmem_scores_for_aux_loss);
-  DataType *topk_logits_buf =
-      reinterpret_cast<DataType *>(logits_buf + num_experts * num_token_per_block);
-  int *topk_indices_buf = reinterpret_cast<int *>(topk_logits_buf + topk * num_token_per_block);
+  int *topk_indices_buf =
+      reinterpret_cast<int *>(logits_buf + num_experts * num_token_per_block);
   // The address of buffers on the current warp
   DataType *local_logits = logits_buf + warp_id * num_experts;
-  DataType *topk_logits = topk_logits_buf + warp_id * topk;
   int *topk_indices = topk_indices_buf + warp_id * topk;
 
   /***
@@ -59,18 +57,10 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
          * - Load the logits to shmem
          */
     int pos_offset = token_offset_cur_warp * num_experts;
-    // Clear the routing_map (num_experts)
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      routing_map[pos_offset + i] = false;
-      if (score_function == 1) {
-        intermediate_output[pos_offset + i] = -std::numeric_limits<DataType>::infinity();
-      }
-    }
     // Load the logits to shmem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       local_logits[i] = logits[pos_offset + i];
     }
-    __threadfence_block();
     __syncwarp();
 
     /***
@@ -103,37 +93,33 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
       }
     }
 
-    __syncwarp();  //Confirm the scores is written to the softmax/sigmoid output
-
     if (score_function == 0) {
       if (topk > 1) {
-        auto sum_logits =
-            warp_reduce_on_shmem(local_logits, num_experts, ReduceFuncType::SUM, lane_id);
+        float sum_logits = static_cast<float>(
+            warp_reduce_on_shmem(local_logits, num_experts, ReduceFuncType::SUM, lane_id));
         for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-          local_logits[i] = static_cast<DataType>(static_cast<double>(local_logits[i]) /
-                                                  (static_cast<double>(sum_logits) + epsilon));
+          local_logits[i] = static_cast<DataType>(static_cast<float>(local_logits[i]) /
+                                                  (sum_logits + epsilon));
         }
       }
       __syncwarp();
+    }
+
+    // Write the scores to the output tensor before topk modifies local_logits.
+    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+      scores[pos_offset + i] = local_logits[i];
     }
 
     /***
          * Section: Topk
          * Get the topk indices
          */
-    naive_topk_and_mask(local_logits, num_experts, topk, topk_indices, topk_logits, lane_id);
-    __syncwarp();
+    naive_topk_indices_inplace(local_logits, num_experts, topk, topk_indices, lane_id);
 
     // Write the routing_map to the output tensor
     for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
       routing_map[pos_offset + topk_indices[i]] = true;
     }
-    // Write the scores to the output tensor
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      scores[pos_offset + i] = local_logits[i];
-    }
-    __threadfence_block();
-    __syncwarp();
   }
 }
 
@@ -141,11 +127,13 @@ template <typename DataType>
 void fused_score_for_moe_aux_loss_forward_kernel_launcher(
     const DataType *logits, int num_tokens, int num_experts, int topk, int score_function,
     DataType *scores, bool *routing_map, DataType *intermediate_output, musaStream_t stream) {
+  const size_t output_elements = static_cast<size_t>(num_tokens) * num_experts;
+  NVTE_CHECK_CUDA(musaMemsetAsync(routing_map, 0, output_elements * sizeof(bool), stream));
+
   // Meta data for the kernel
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // logits
-                              + topk * num_token_per_block * sizeof(DataType)       // topk_logits
                               + topk * num_token_per_block * sizeof(int);           // topk_indices
   fused_score_for_moe_aux_loss_forward_kernel<DataType>
       <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
@@ -212,16 +200,11 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *int
          * - Load the dgrad/output_from_fwd to shmem
          */
     int pos_offset = token_offset_cur_warp * num_experts;
-    // Clear the logits_grad in global mem
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      grad_logits[pos_offset + i] = 0.0f;
-    }
     // Load the dgrad/output_from_fwd to shmem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       local_grad[i] = grad_scores[pos_offset + i];
       local_act_from_fwd[i] = intermediate_output[pos_offset + i];
     }
-    __threadfence_block();
     __syncwarp();
 
     /***
@@ -233,22 +216,22 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *int
          */
     // Sigmoid Post-processing bwd when topk > 1
     if (topk > 1 && score_function == 0) {
-      auto sum_fwd_input =
-          warp_reduce_on_shmem(local_act_from_fwd, num_experts, ReduceFuncType::SUM, lane_id);
+      float sum_fwd_input = static_cast<float>(
+          warp_reduce_on_shmem(local_act_from_fwd, num_experts, ReduceFuncType::SUM, lane_id));
       // Put the result of output * grad to the comp_buf
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        local_comp_buf[i] = local_grad[i] * local_act_from_fwd[i];
+        local_comp_buf[i] = static_cast<DataType>(static_cast<float>(local_grad[i]) *
+                                                  static_cast<float>(local_act_from_fwd[i]));
       }
       __syncwarp();
-      auto sum_Output_x_Grad =
-          warp_reduce_on_shmem(local_comp_buf, num_experts, ReduceFuncType::SUM, lane_id);
+      float sum_Output_x_Grad = static_cast<float>(
+          warp_reduce_on_shmem(local_comp_buf, num_experts, ReduceFuncType::SUM, lane_id));
       // In-place update
+      float norm_inv = 1.0f / (sum_fwd_input + epsilon);
+      float corr = sum_Output_x_Grad * norm_inv * norm_inv;
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
         local_grad[i] =
-            static_cast<double>(local_grad[i]) / (static_cast<double>(sum_fwd_input) + epsilon) -
-            static_cast<double>(sum_Output_x_Grad) /
-                ((static_cast<double>(sum_fwd_input) + epsilon) *
-                 (static_cast<double>(sum_fwd_input) + epsilon));
+            static_cast<DataType>(static_cast<float>(local_grad[i]) * norm_inv - corr);
       }
     }
     __syncwarp();

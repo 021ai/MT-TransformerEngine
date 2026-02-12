@@ -7,6 +7,9 @@
 #ifndef TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 #define TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 
+#include <limits>
+#include <math.h>
+
 #include "transformer_engine/transformer_engine.h"
 
 namespace transformer_engine {
@@ -34,30 +37,23 @@ enum ReduceFuncType {
 template <typename T>
 __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncType type,
                                          int lane_id) {
-  T (*reduce_func)(T, T);
-  double default_val = 0;
-  if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
-  }
+  const float default_val = (type == ReduceFuncType::SUM) ? 0.0f
+                                                           : -std::numeric_limits<float>::infinity();
 
   // Some value is hanlded in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile double val = lane_id < data_size ? static_cast<double>(data_ptr[lane_id]) : default_val;
+  float val = lane_id < data_size ? static_cast<float>(data_ptr[lane_id]) : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-    val = reduce_func(val, data_ptr[i]);
+    float cur = static_cast<float>(data_ptr[i]);
+    val = (type == ReduceFuncType::SUM) ? (val + cur) : fmaxf(val, cur);
   }
 
   // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
+  for (int s = 16; s > 0; s /= 2) {
+    float shuffled = __shfl_xor_sync(0xffffffff, val, s);
+    val = (type == ReduceFuncType::SUM) ? (val + shuffled) : fmaxf(val, shuffled);
+  }
   __syncwarp();
   return T(val);
 }
@@ -65,40 +61,34 @@ __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncT
 template <typename DataType>
 __device__ inline void apply_sigmoid_on_float(DataType *scores, int data_size, int lane_id) {
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = static_cast<float>(1.0f / (1.0f + exp(-static_cast<float>(scores[i]))));
+    float score = static_cast<float>(scores[i]);
+    scores[i] = static_cast<float>(1.0f / (1.0f + expf(-score)));
   }
 }
 
 template <typename T>
 __device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int data_size,
                                                 ReduceFuncType type, int lane_id) {
-  T (*reduce_func)(T, T);
-  double default_val = 0;
-  if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
-  }
+  const float default_val = (type == ReduceFuncType::SUM) ? 0.0f
+                                                           : -std::numeric_limits<float>::infinity();
 
   // Some value is hanlded in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile double val =
-      lane_id < data_size && mask[lane_id] ? static_cast<double>(data_ptr[lane_id]) : default_val;
+  float val =
+      lane_id < data_size && mask[lane_id] ? static_cast<float>(data_ptr[lane_id]) : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
     if (mask[i]) {
-      val = reduce_func(val, data_ptr[i]);
+      float cur = static_cast<float>(data_ptr[i]);
+      val = (type == ReduceFuncType::SUM) ? (val + cur) : fmaxf(val, cur);
     }
   }
 
   // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
+  for (int s = 16; s > 0; s /= 2) {
+    float shuffled = __shfl_xor_sync(0xffffffff, val, s);
+    val = (type == ReduceFuncType::SUM) ? (val + shuffled) : fmaxf(val, shuffled);
+  }
   __syncwarp();
   return T(val);
 }
@@ -107,8 +97,8 @@ template <typename DataType>
 __device__ inline void apply_sigmoid_bwd_on_float(DataType *grad, DataType *fwd_output,
                                                   int data_size, int lane_id) {
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    grad[i] = static_cast<double>(grad[i]) * static_cast<double>(fwd_output[i]) *
-              (1 - static_cast<double>(fwd_output[i]));
+    float fwd_out = static_cast<float>(fwd_output[i]);
+    grad[i] = static_cast<float>(grad[i]) * fwd_out * (1.0f - fwd_out);
   }
 }
 
@@ -154,7 +144,7 @@ __device__ inline void apply_softmax_on_float(DataType *scores, int data_size, i
       static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::MAX, lane_id));
   // 2. value -> exp_value
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = static_cast<float>(exp(static_cast<float>(scores[i]) - max_val));
+    scores[i] = static_cast<float>(expf(static_cast<float>(scores[i]) - max_val));
   }
   __syncwarp();
   // 3. compute the sum of exp_value
@@ -181,18 +171,18 @@ __device__ inline void naive_topk_and_mask(T *scores, int data_size, int topk, i
   // Topk Times: Find the max value and its index
   // Then mask it, and record the index in the topk_indices
   // After looping topk times, the topk_indices will be the topk indices
+  const float neg_inf = -std::numeric_limits<float>::infinity();
   for (int k = 0; k < topk; k++) {
     // Find the max value and its index
-    volatile double val = (lane_id < data_size && !is_masked(k, lane_id))
-                              ? static_cast<double>(scores[lane_id])
-                              : -std::numeric_limits<double>::infinity();
-    volatile int index = (lane_id < data_size) ? lane_id : 0;
+    float val = (lane_id < data_size && !is_masked(k, lane_id))
+                    ? static_cast<float>(scores[lane_id])
+                    : neg_inf;
+    int index = (lane_id < data_size) ? lane_id : 0;
     // Some value is hanlded in local thread
     // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
     // Reduce the value in local thread
     for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-      volatile double cur_val = (is_masked(k, i)) ? -std::numeric_limits<double>::infinity()
-                                                  : static_cast<double>(scores[i]);
+      float cur_val = (is_masked(k, i)) ? neg_inf : static_cast<float>(scores[i]);
       if (cur_val > val) {
         val = cur_val;
         index = i;
@@ -200,8 +190,8 @@ __device__ inline void naive_topk_and_mask(T *scores, int data_size, int topk, i
     }
     // Warp shuffle between threads
     for (int s = 16; s > 0; s /= 2) {
-      volatile auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
-      volatile auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      float shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      int shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
       if (shuffled_val > val) {
         val = shuffled_val;
         index = shuffled_index;
@@ -209,7 +199,69 @@ __device__ inline void naive_topk_and_mask(T *scores, int data_size, int topk, i
     }
     if (lane_id == 0) {
       topk_indices[k] = index;
-      topk_scores[k] = val;
+      topk_scores[k] = static_cast<T>(val);
+    }
+    __syncwarp();
+  }
+}
+
+template <typename T>
+__device__ inline void naive_topk_and_mask_inplace(T *scores, int data_size, int topk,
+                                                    int *topk_indices, T *topk_scores,
+                                                    int lane_id) {
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+  for (int k = 0; k < topk; k++) {
+    float val = lane_id < data_size ? static_cast<float>(scores[lane_id]) : neg_inf;
+    int index = lane_id < data_size ? lane_id : 0;
+    for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
+      float cur_val = static_cast<float>(scores[i]);
+      if (cur_val > val) {
+        val = cur_val;
+        index = i;
+      }
+    }
+    for (int s = 16; s > 0; s /= 2) {
+      float shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      int shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      if (shuffled_val > val) {
+        val = shuffled_val;
+        index = shuffled_index;
+      }
+    }
+    if (lane_id == 0) {
+      topk_indices[k] = index;
+      topk_scores[k] = static_cast<T>(val);
+      scores[index] = static_cast<T>(neg_inf);
+    }
+    __syncwarp();
+  }
+}
+
+template <typename T>
+__device__ inline void naive_topk_indices_inplace(T *scores, int data_size, int topk,
+                                                   int *topk_indices, int lane_id) {
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+  for (int k = 0; k < topk; k++) {
+    float val = lane_id < data_size ? static_cast<float>(scores[lane_id]) : neg_inf;
+    int index = lane_id < data_size ? lane_id : 0;
+    for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
+      float cur_val = static_cast<float>(scores[i]);
+      if (cur_val > val) {
+        val = cur_val;
+        index = i;
+      }
+    }
+    for (int s = 16; s > 0; s /= 2) {
+      float shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      int shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      if (shuffled_val > val) {
+        val = shuffled_val;
+        index = shuffled_index;
+      }
+    }
+    if (lane_id == 0) {
+      topk_indices[k] = index;
+      scores[index] = static_cast<T>(neg_inf);
     }
     __syncwarp();
   }
