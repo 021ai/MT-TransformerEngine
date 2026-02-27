@@ -113,8 +113,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_score_for_moe_aux_loss_fwd(
       at::empty({num_tokens, num_experts}, at::dtype(logits.scalar_type()).device(at::kMUSA));
   at::Tensor routing_map =
       at::empty({num_tokens, num_experts}, at::dtype(at::kBool).device(at::kMUSA));
+  bool share_scores_storage = (score_function == "softmax") || (topk == 1);
   at::Tensor intermediate_output =
-      at::empty({num_tokens, num_experts}, at::dtype(logits.scalar_type()).device(at::kMUSA));
+      share_scores_storage
+          ? scores
+          : at::empty({num_tokens, num_experts},
+                      at::dtype(logits.scalar_type()).device(at::kMUSA));
 
   auto logits_cu = makeTransformerEngineTensor(logits);
   auto scores_cu = makeTransformerEngineTensor(scores);
@@ -157,9 +161,25 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
   TORCH_CHECK(total_num_tokens > 0, "total_num_tokens must be greater than 0");
   TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
 
+  constexpr int threads_x = 128;
+  constexpr int threads_y = 2;
+  int grid_x = (num_cols + threads_x - 1) / threads_x;
+  int grid_y = (num_rows + threads_y - 1) / threads_y;
+  int max_grid_y = at::musa::getCurrentDeviceProperties()->multiProcessorCount * 8;
+  if (max_grid_y < 1) {
+    max_grid_y = 1;
+  }
+  if (grid_y > max_grid_y) {
+    grid_y = max_grid_y;
+  }
+  int partial_count = grid_x * grid_y;
+  if (partial_count < 1) {
+    partial_count = 1;
+  }
+
   // Create the output tensor
   at::Tensor aux_loss = at::empty({}, at::dtype(probs.scalar_type()).device(at::kMUSA));
-  at::Tensor Const_buf = at::empty({}, at::dtype(at::kFloat).device(at::kMUSA));
+  at::Tensor Const_buf = at::empty({partial_count}, at::dtype(at::kFloat).device(at::kMUSA));
 
   auto probs_cu = makeTransformerEngineTensor(probs);
   auto tokens_per_expert_cu = makeTransformerEngineTensor(tokens_per_expert);

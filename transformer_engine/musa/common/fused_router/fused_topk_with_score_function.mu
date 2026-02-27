@@ -10,17 +10,29 @@
 
 #include "../common.h"
 #include "../util/logging.h"
+#include "../util/musa_runtime.h"
 #include "../utils.muh"
 #include "utils.h"
 
 namespace transformer_engine {
 
-template <typename DataType, typename BiasType>
+constexpr size_t kRouterShmemBudgetBytes = 48 * 1024;
+
+inline int select_block_size_by_shmem(size_t per_token_shmem_bytes) {
+  int block_size = 256;
+  size_t shmem = per_token_shmem_bytes * static_cast<size_t>(block_size / kThreadsPerWarp);
+  if (shmem <= kRouterShmemBudgetBytes) return block_size;
+  block_size = 128;
+  shmem = per_token_shmem_bytes * static_cast<size_t>(block_size / kThreadsPerWarp);
+  if (shmem <= kRouterShmemBudgetBytes) return block_size;
+  return 64;
+}
+
+template <typename DataType, typename BiasType, bool kSoftmax, bool kUsePreSoftmax>
 __global__ void fused_topk_with_score_function_forward_kernel(
-    const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
-    int num_groups, int group_topk, float scaling_factor, int score_function,
-    bool use_double_buffer, const BiasType *expert_bias, DataType *probs, bool *routing_map,
-    DataType *intermediate_output) {
+    const DataType *logits, int num_tokens, int num_experts, int topk, int num_groups,
+    int group_topk, float scaling_factor, bool use_double_buffer, const BiasType *expert_bias,
+    DataType *probs, bool *routing_map, DataType *intermediate_output) {
   /***
      * Section: Global Variables/Addresses init
      * - Assume the sizeof(DataType) >= sizeof(int),
@@ -103,7 +115,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
          * This is in-place scores update
          */
     // score_function == 1 means softmax
-    if (use_pre_softmax && score_function == 1) {
+    if constexpr (kSoftmax && kUsePreSoftmax) {
       // Apply softmax to the logits before the topk
       apply_softmax_on_float(scores, num_experts, lane_id);
       __syncwarp();
@@ -114,7 +126,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
     }
 
     // score_function == 0 means sigmoid
-    if (score_function == 0) {
+    if constexpr (!kSoftmax) {
       // Apply sigmoid to the logits
       apply_sigmoid_on_float(scores, num_experts, lane_id);
       __syncwarp();
@@ -127,10 +139,12 @@ __global__ void fused_topk_with_score_function_forward_kernel(
     __syncwarp();  //Confirm the scores is written to the softmax/sigmoid output
 
     // Expert bias is only used at the sigmoid case
-    if (expert_bias && score_function == 0) {
-      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        scores[i] = static_cast<DataType>(static_cast<float>(scores[i]) +
-                                          static_cast<float>(expert_bias[i]));
+    if constexpr (!kSoftmax) {
+      if (expert_bias) {
+        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+          scores[i] = static_cast<DataType>(static_cast<float>(scores[i]) +
+                                            static_cast<float>(expert_bias[i]));
+        }
       }
     }
     __syncwarp();
@@ -202,16 +216,18 @@ __global__ void fused_topk_with_score_function_forward_kernel(
          * - Write the result with scaling_factor
          */
     // Revert Expert bias from the topk scores
-    if (expert_bias && score_function == 0) {
-      for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
-        topk_scores[i] = static_cast<DataType>(static_cast<float>(topk_scores[i]) -
-                                               static_cast<float>(expert_bias[topk_indices[i]]));
+    if constexpr (!kSoftmax) {
+      if (expert_bias) {
+        for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
+          topk_scores[i] = static_cast<DataType>(
+              static_cast<float>(topk_scores[i]) - static_cast<float>(expert_bias[topk_indices[i]]));
+        }
       }
     }
     __syncwarp();
 
     // score_function == 1 means softmax
-    if (!use_pre_softmax && score_function == 1) {
+    if constexpr (kSoftmax && !kUsePreSoftmax) {
       // Apply softmax to the topk logits
       apply_softmax_on_float(topk_scores, topk, lane_id);
       __syncwarp();
@@ -222,7 +238,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
     }
 
     // score_function == 0 means sigmoid
-    if (score_function == 0) {
+    if constexpr (!kSoftmax) {
       if (topk > 1) {
         float sum_scores = static_cast<float>(
             warp_reduce_on_shmem(topk_scores, topk, ReduceFuncType::SUM, lane_id));
@@ -271,22 +287,42 @@ void fused_topk_with_score_function_forward_kernel_launcher(
   NVTE_CHECK_CUDA(musaMemsetAsync(probs, 0, output_elements * sizeof(DataType), stream));
   NVTE_CHECK_CUDA(musaMemsetAsync(routing_map, 0, output_elements * sizeof(bool), stream));
 
-  size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
-  size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t scores_buffers = use_double_buffer ? 2 : 1;
-  size_t shared_memory_size =
-      scores_buffers * num_experts * num_token_per_block * sizeof(DataType)  // scores
-      + topk * num_token_per_block * sizeof(DataType)                        // topk_scores
-      + topk * num_token_per_block * sizeof(int);                            // topk_indices
+  size_t per_token_shmem_bytes = scores_buffers * num_experts * sizeof(DataType)  // scores
+                                 + topk * sizeof(DataType)                        // topk_scores
+                                 + topk * sizeof(int);                            // topk_indices
   if (group_topk > 0) {
-    shared_memory_size += num_groups * num_token_per_block * sizeof(DataType);   // group_scores
-    shared_memory_size += num_experts * num_token_per_block * sizeof(DataType);  // maksed_scores
+    per_token_shmem_bytes += num_groups * sizeof(DataType);   // group_scores
+    per_token_shmem_bytes += num_experts * sizeof(DataType);  // masked_scores
   }
-  fused_topk_with_score_function_forward_kernel<DataType, BiasType>
-      <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
-          logits, num_tokens, num_experts, topk, use_pre_softmax, num_groups, group_topk,
-          scaling_factor, score_function, use_double_buffer, expert_bias, probs, routing_map,
-          intermediate_output);
+  int block_size = select_block_size_by_shmem(per_token_shmem_bytes);
+  size_t num_token_per_block = static_cast<size_t>(block_size / kThreadsPerWarp);
+  size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
+  size_t max_grid_size = static_cast<size_t>(cuda::sm_count()) * 8;
+  if (max_grid_size < 1) max_grid_size = 1;
+  if (grid_size > max_grid_size) grid_size = max_grid_size;
+  size_t shared_memory_size = per_token_shmem_bytes * num_token_per_block;
+
+  if (score_function == 1) {
+    if (use_pre_softmax) {
+      fused_topk_with_score_function_forward_kernel<DataType, BiasType, true, true>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, num_groups, group_topk, scaling_factor,
+              use_double_buffer, expert_bias, probs, routing_map, intermediate_output);
+    } else {
+      fused_topk_with_score_function_forward_kernel<DataType, BiasType, true, false>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, num_groups, group_topk, scaling_factor,
+              use_double_buffer, expert_bias, probs, routing_map, intermediate_output);
+    }
+  } else if (score_function == 0) {
+    fused_topk_with_score_function_forward_kernel<DataType, BiasType, false, false>
+        <<<grid_size, block_size, shared_memory_size, stream>>>(
+            logits, num_tokens, num_experts, topk, num_groups, group_topk, scaling_factor,
+            use_double_buffer, expert_bias, probs, routing_map, intermediate_output);
+  } else {
+    NVTE_ERROR("Invalid score_function.");
+  }
   NVTE_CHECK_CUDA(musaGetLastError());
 }
 
@@ -309,13 +345,12 @@ void fused_topk_with_score_function_forward(const Tensor logits, int num_tokens,
               reinterpret_cast<DataType *>(intermediate_output.data.dptr), stream);););
 }
 
-template <typename DataType>
+template <typename DataType, bool kSoftmax, bool kUsePreSoftmax>
 __global__ void fused_topk_with_score_function_backward_kernel(
     // Inputs tensor
     const bool *routing_map, const DataType *intermediate_output, const DataType *grad_probs,
     // Other parameters
-    int num_tokens, int num_experts, int topk, bool use_pre_softmax, float scaling_factor,
-    int score_function,
+    int num_tokens, int num_experts, int topk, float scaling_factor,
     // Output tensor
     DataType *grad_logits) {
   /***
@@ -383,7 +418,8 @@ __global__ void fused_topk_with_score_function_backward_kernel(
     }
     __syncwarp();
     // Sigmoid Post-processing bwd when topk > 1
-    if (topk > 1 && score_function == 0) {
+    if constexpr (!kSoftmax) {
+      if (topk > 1) {
       float sum_fwd_input = static_cast<float>(masked_warp_reduce_on_shmem(
           /*data ptr = */ local_act_from_fwd,
           /*mask ptr = */ local_routing_map,
@@ -412,10 +448,11 @@ __global__ void fused_topk_with_score_function_backward_kernel(
           local_grad[i] = 0.0f;
         }
       }
+      }
     }
     __syncwarp();
     // Softmax bwd if use_pre_softmax is false
-    if (!use_pre_softmax && score_function == 1) {
+    if constexpr (kSoftmax && !kUsePreSoftmax) {
       apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, local_routing_map,
                                  num_experts, lane_id);
       __syncwarp();
@@ -439,13 +476,13 @@ __global__ void fused_topk_with_score_function_backward_kernel(
          * - Write the grad_logits to the global mem
          */
     // Pre-softmax bwd
-    if (score_function == 1 && use_pre_softmax) {
+    if constexpr (kSoftmax && kUsePreSoftmax) {
       apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, nullptr,
                                  num_experts, lane_id);
       __syncwarp();
     }
     // Sigmoid bwd
-    if (score_function == 0) {
+    if constexpr (!kSoftmax) {
       apply_sigmoid_bwd_on_float(local_grad, local_act_from_fwd, num_experts, lane_id);
       __syncwarp();
     }
@@ -463,17 +500,38 @@ void fused_topk_with_score_function_backward_kernel_launcher(
     int num_tokens, int num_experts, int topk, bool use_pre_softmax, float scaling_factor,
     int score_function, DataType *grad_logits, musaStream_t stream) {
   // Meta data for the kernel
-  size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
+  size_t per_token_shmem_bytes =
+      num_experts * sizeof(DataType)       // grad_probs
+      + num_experts * sizeof(DataType)     // act_from_fwd
+      + num_experts * sizeof(DataType)     // comp_buf
+      + num_experts * sizeof(bool);        // routing_map
+  int block_size = select_block_size_by_shmem(per_token_shmem_bytes);
+  size_t num_token_per_block = static_cast<size_t>(block_size / kThreadsPerWarp);
   size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
-  size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // grad_probs
-                              +
-                              num_experts * num_token_per_block * sizeof(DataType)  // act_from_fwd
-                              + num_experts * num_token_per_block * sizeof(DataType)  // comp_buf
-                              + num_experts * num_token_per_block * sizeof(bool);     // routing_map
-  fused_topk_with_score_function_backward_kernel<DataType>
-      <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
-          routing_map, intermediate_output, grad_probs, num_tokens, num_experts, topk,
-          use_pre_softmax, scaling_factor, score_function, grad_logits);
+  size_t max_grid_size = static_cast<size_t>(cuda::sm_count()) * 8;
+  if (max_grid_size < 1) max_grid_size = 1;
+  if (grid_size > max_grid_size) grid_size = max_grid_size;
+  size_t shared_memory_size = per_token_shmem_bytes * num_token_per_block;
+  if (score_function == 1) {
+    if (use_pre_softmax) {
+      fused_topk_with_score_function_backward_kernel<DataType, true, true>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              routing_map, intermediate_output, grad_probs, num_tokens, num_experts, topk,
+              scaling_factor, grad_logits);
+    } else {
+      fused_topk_with_score_function_backward_kernel<DataType, true, false>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              routing_map, intermediate_output, grad_probs, num_tokens, num_experts, topk,
+              scaling_factor, grad_logits);
+    }
+  } else if (score_function == 0) {
+    fused_topk_with_score_function_backward_kernel<DataType, false, false>
+        <<<grid_size, block_size, shared_memory_size, stream>>>(
+            routing_map, intermediate_output, grad_probs, num_tokens, num_experts, topk,
+            scaling_factor, grad_logits);
+  } else {
+    NVTE_ERROR("Invalid score_function.");
+  }
   NVTE_CHECK_CUDA(musaGetLastError());
 }
 

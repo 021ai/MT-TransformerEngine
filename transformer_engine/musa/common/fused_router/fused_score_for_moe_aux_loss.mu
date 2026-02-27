@@ -10,16 +10,28 @@
 
 #include "../common.h"
 #include "../util/logging.h"
+#include "../util/musa_runtime.h"
 #include "../utils.muh"
 #include "utils.h"
 
 namespace transformer_engine {
 
-template <typename DataType>
+constexpr size_t kRouterShmemBudgetBytes = 48 * 1024;
+
+inline int select_block_size_by_shmem(size_t per_token_shmem_bytes) {
+  int block_size = 256;
+  size_t shmem = per_token_shmem_bytes * static_cast<size_t>(block_size / kThreadsPerWarp);
+  if (shmem <= kRouterShmemBudgetBytes) return block_size;
+  block_size = 128;
+  shmem = per_token_shmem_bytes * static_cast<size_t>(block_size / kThreadsPerWarp);
+  if (shmem <= kRouterShmemBudgetBytes) return block_size;
+  return 64;
+}
+
+template <typename DataType, bool kSoftmax, bool kScoresShared>
 __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logits, int num_tokens,
                                                             int num_experts, int topk,
-                                                            int score_function, DataType *scores,
-                                                            bool *routing_map,
+                                                            DataType *scores, bool *routing_map,
                                                             DataType *intermediate_output) {
   /***
      * Section: Global Variables/Addresses init
@@ -71,19 +83,14 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
          * - Sigmoid post-processing when topk > 1
          * This is in-place scores update
          */
-    // score_function == 1 means softmax
-    if (score_function == 1) {
+    if (kSoftmax) {
       // Apply softmax to the logits before the topk
       apply_softmax_on_float(local_logits, num_experts, lane_id);
-      __syncwarp();
       // Save the softmax output for backward
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
         intermediate_output[pos_offset + i] = local_logits[i];
       }
-    }
-
-    // score_function == 0 means sigmoid
-    if (score_function == 0) {
+    } else {
       // Apply sigmoid to the logits
       apply_sigmoid_on_float(local_logits, num_experts, lane_id);
       __syncwarp();
@@ -91,9 +98,6 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
         intermediate_output[pos_offset + i] = local_logits[i];
       }
-    }
-
-    if (score_function == 0) {
       if (topk > 1) {
         float sum_logits = static_cast<float>(
             warp_reduce_on_shmem(local_logits, num_experts, ReduceFuncType::SUM, lane_id));
@@ -105,9 +109,11 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
       __syncwarp();
     }
 
-    // Write the scores to the output tensor before topk modifies local_logits.
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      scores[pos_offset + i] = local_logits[i];
+    // Write scores only when it doesn't share the same buffer with intermediate_output.
+    if (!kScoresShared) {
+      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+        scores[pos_offset + i] = local_logits[i];
+      }
     }
 
     /***
@@ -131,14 +137,39 @@ void fused_score_for_moe_aux_loss_forward_kernel_launcher(
   NVTE_CHECK_CUDA(musaMemsetAsync(routing_map, 0, output_elements * sizeof(bool), stream));
 
   // Meta data for the kernel
-  size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
+  size_t per_token_shmem_bytes = num_experts * sizeof(DataType) + topk * sizeof(int);
+  int block_size = select_block_size_by_shmem(per_token_shmem_bytes);
+  size_t num_token_per_block = block_size / kThreadsPerWarp;
   size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
+  size_t max_grid_size = static_cast<size_t>(cuda::sm_count()) * 8;
+  if (max_grid_size < 1) max_grid_size = 1;
+  if (grid_size > max_grid_size) grid_size = max_grid_size;
   size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // logits
                               + topk * num_token_per_block * sizeof(int);           // topk_indices
-  fused_score_for_moe_aux_loss_forward_kernel<DataType>
-      <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
-          logits, num_tokens, num_experts, topk, score_function, scores, routing_map,
-          intermediate_output);
+  bool scores_shared = (scores == intermediate_output);
+  if (score_function == 1) {
+    if (scores_shared) {
+      fused_score_for_moe_aux_loss_forward_kernel<DataType, true, true>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, scores, routing_map, intermediate_output);
+    } else {
+      fused_score_for_moe_aux_loss_forward_kernel<DataType, true, false>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, scores, routing_map, intermediate_output);
+    }
+  } else if (score_function == 0) {
+    if (scores_shared) {
+      fused_score_for_moe_aux_loss_forward_kernel<DataType, false, true>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, scores, routing_map, intermediate_output);
+    } else {
+      fused_score_for_moe_aux_loss_forward_kernel<DataType, false, false>
+          <<<grid_size, block_size, shared_memory_size, stream>>>(
+              logits, num_tokens, num_experts, topk, scores, routing_map, intermediate_output);
+    }
+  } else {
+    NVTE_ERROR("Invalid score_function.");
+  }
   NVTE_CHECK_CUDA(musaGetLastError());
 }
 
@@ -155,12 +186,11 @@ void fused_score_for_moe_aux_loss_forward(const Tensor &logits, int num_tokens, 
           reinterpret_cast<DataType *>(intermediate_output.data.dptr), stream););
 }
 
-template <typename DataType>
+template <typename DataType, bool kSoftmax>
 __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *intermediate_output,
                                                              const DataType *grad_scores,
                                                              int num_tokens, int num_experts,
-                                                             int topk, int score_function,
-                                                             DataType *grad_logits) {
+                                                             int topk, DataType *grad_logits) {
   /***
      * Section: Global Variables/Addresses init
      * - Assume the sizeof(DataType) >= sizeof(int),
@@ -214,44 +244,37 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *int
          * - Sigmoid bwd
          * - Write the grad_logits to the global mem
          */
-    // Sigmoid Post-processing bwd when topk > 1
-    if (topk > 1 && score_function == 0) {
-      float sum_fwd_input = static_cast<float>(
-          warp_reduce_on_shmem(local_act_from_fwd, num_experts, ReduceFuncType::SUM, lane_id));
-      // Put the result of output * grad to the comp_buf
-      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        local_comp_buf[i] = static_cast<DataType>(static_cast<float>(local_grad[i]) *
-                                                  static_cast<float>(local_act_from_fwd[i]));
+    if (!kSoftmax) {
+      // Sigmoid Post-processing bwd when topk > 1
+      if (topk > 1) {
+        float sum_fwd_input = static_cast<float>(
+            warp_reduce_on_shmem(local_act_from_fwd, num_experts, ReduceFuncType::SUM, lane_id));
+        // Put the result of output * grad to the comp_buf
+        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+          local_comp_buf[i] = static_cast<DataType>(static_cast<float>(local_grad[i]) *
+                                                    static_cast<float>(local_act_from_fwd[i]));
+        }
+        __syncwarp();
+        float sum_Output_x_Grad = static_cast<float>(
+            warp_reduce_on_shmem(local_comp_buf, num_experts, ReduceFuncType::SUM, lane_id));
+        // In-place update
+        float norm_inv = 1.0f / (sum_fwd_input + epsilon);
+        float corr = sum_Output_x_Grad * norm_inv * norm_inv;
+        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+          local_grad[i] =
+              static_cast<DataType>(static_cast<float>(local_grad[i]) * norm_inv - corr);
+        }
       }
-      __syncwarp();
-      float sum_Output_x_Grad = static_cast<float>(
-          warp_reduce_on_shmem(local_comp_buf, num_experts, ReduceFuncType::SUM, lane_id));
-      // In-place update
-      float norm_inv = 1.0f / (sum_fwd_input + epsilon);
-      float corr = sum_Output_x_Grad * norm_inv * norm_inv;
-      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        local_grad[i] =
-            static_cast<DataType>(static_cast<float>(local_grad[i]) * norm_inv - corr);
-      }
-    }
-    __syncwarp();
-
-    // Pre-softmax bwd
-    if (score_function == 1) {
+      apply_sigmoid_bwd_on_float(local_grad, local_act_from_fwd, num_experts, lane_id);
+    } else {
+      // Pre-softmax bwd
       apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, nullptr,
                                  num_experts, lane_id);
-      __syncwarp();
-    }
-    // Sigmoid bwd
-    if (score_function == 0) {
-      apply_sigmoid_bwd_on_float(local_grad, local_act_from_fwd, num_experts, lane_id);
-      __syncwarp();
     }
     // Write the grad_logits to the global mem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       grad_logits[pos_offset + i] = local_grad[i];
     }
-    __syncwarp();
   }
 }
 
@@ -260,16 +283,28 @@ void fused_score_for_moe_aux_loss_backward_kernel_launcher(
     const DataType *intermediate_output, const DataType *grad_scores, int num_tokens,
     int num_experts, int topk, int score_function, DataType *grad_logits, musaStream_t stream) {
   // Meta data for the kernel
-  size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
+  size_t per_token_shmem_bytes = 3 * num_experts * sizeof(DataType);
+  int block_size = select_block_size_by_shmem(per_token_shmem_bytes);
+  size_t num_token_per_block = block_size / kThreadsPerWarp;
   size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
+  size_t max_grid_size = static_cast<size_t>(cuda::sm_count()) * 8;
+  if (max_grid_size < 1) max_grid_size = 1;
+  if (grid_size > max_grid_size) grid_size = max_grid_size;
   size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // grad_scores
                               +
                               num_experts * num_token_per_block * sizeof(DataType)  // act_from_fwd
                               + num_experts * num_token_per_block * sizeof(DataType);  // comp_buf
-  fused_score_for_moe_aux_loss_backward_kernel<DataType>
-      <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
-          intermediate_output, grad_scores, num_tokens, num_experts, topk, score_function,
-          grad_logits);
+  if (score_function == 1) {
+    fused_score_for_moe_aux_loss_backward_kernel<DataType, true>
+        <<<grid_size, block_size, shared_memory_size, stream>>>(
+            intermediate_output, grad_scores, num_tokens, num_experts, topk, grad_logits);
+  } else if (score_function == 0) {
+    fused_score_for_moe_aux_loss_backward_kernel<DataType, false>
+        <<<grid_size, block_size, shared_memory_size, stream>>>(
+            intermediate_output, grad_scores, num_tokens, num_experts, topk, grad_logits);
+  } else {
+    NVTE_ERROR("Invalid score_function.");
+  }
   NVTE_CHECK_CUDA(musaGetLastError());
 }
 

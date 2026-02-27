@@ -23,7 +23,7 @@ template <typename DataType, typename IndexType>
 __global__ void fused_moe_aux_loss_forward_reduce_kernel(const DataType* probs,
                                                          const IndexType* tokens_per_expert,
                                                          int num_rows, int num_cols,
-                                                         float* sum_buf) {
+                                                         float* partial_buf) {
   int linear_tid = threadIdx.y * blockDim.x + threadIdx.x;
   int threads_per_block = blockDim.x * blockDim.y;
   int warp_num = threads_per_block / kThreadsPerWarp;
@@ -55,23 +55,41 @@ __global__ void fused_moe_aux_loss_forward_reduce_kernel(const DataType* probs,
       block_sum += __shfl_xor_sync(0xffffffff, block_sum, s);
     }
     if (lane_id == 0) {
-      atomicAdd(sum_buf, static_cast<float>(block_sum));
+      int block_linear_idx = blockIdx.y * gridDim.x + blockIdx.x;
+      partial_buf[block_linear_idx] = static_cast<float>(block_sum);
     }
   }
 }
 
 template <typename DataType>
 __global__ void fused_moe_aux_loss_forward_finalize_kernel(int total_num_tokens, int num_experts,
-                                                           int topk, float coeff,
-                                                           const float* sum_buf,
+                                                           int topk, float coeff, int partial_count,
+                                                           const float* partial_buf,
                                                            DataType* aux_loss,
                                                            float* Const_buf) {
-  if (blockIdx.x > 0 || threadIdx.x > 0) return;
-  float tokens = static_cast<float>(total_num_tokens);
-  float C_coeff = static_cast<float>(num_experts) * coeff /
-                  (static_cast<float>(topk) * tokens * tokens);
-  aux_loss[0] = static_cast<DataType>(sum_buf[0] * C_coeff);
-  Const_buf[0] = C_coeff;
+  extern __shared__ float shmem[];
+  int tid = threadIdx.x;
+  float local_sum = 0.0f;
+  for (int i = tid; i < partial_count; i += blockDim.x) {
+    local_sum += partial_buf[i];
+  }
+  shmem[tid] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shmem[tid] += shmem[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    float tokens = static_cast<float>(total_num_tokens);
+    float C_coeff = static_cast<float>(num_experts) * coeff /
+                    (static_cast<float>(topk) * tokens * tokens);
+    aux_loss[0] = static_cast<DataType>(shmem[0] * C_coeff);
+    Const_buf[0] = C_coeff;
+  }
 }
 
 template <typename DataType, typename IndexType>
@@ -94,13 +112,14 @@ void fused_moe_aux_loss_forward_kernel_launcher(const DataType* probs,
     grid_y = max_grid_y;
   }
   dim3 grid(grid_x, grid_y);
+  int partial_count = grid_x * grid_y;
+  constexpr int finalize_block = 256;
 
-  NVTE_CHECK_CUDA(musaMemsetAsync(Const_buf, 0, sizeof(float), stream));
   fused_moe_aux_loss_forward_reduce_kernel<DataType, IndexType>
       <<<grid, block, 0, stream>>>(probs, tokens_per_expert, num_rows, num_cols, Const_buf);
   fused_moe_aux_loss_forward_finalize_kernel<DataType>
-      <<<1, 1, 0, stream>>>(total_num_tokens, num_experts, topk, coeff, Const_buf, aux_loss,
-                            Const_buf);
+      <<<1, finalize_block, finalize_block * sizeof(float), stream>>>(
+          total_num_tokens, num_experts, topk, coeff, partial_count, Const_buf, aux_loss, Const_buf);
   NVTE_CHECK_CUDA(musaGetLastError());
 }
 
